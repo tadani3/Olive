@@ -482,6 +482,35 @@ class OnnxEvaluatorMixin:
         return inference_settings
 
 
+def _find_genai_config(model: ONNXModelHandler) -> Optional[Path]:
+    """Find genai_config.json by searching upward from the ONNX file's parent directory.
+
+    Returns the Path to genai_config.json if found, or None. Searches at most
+    3 levels up to avoid traversing unrelated directories.
+    """
+    candidate = Path(model.model_path).parent
+    for _ in range(3):
+        genai_path = candidate / "genai_config.json"
+        if genai_path.is_file():
+            return genai_path
+        parent = candidate.parent
+        if parent == candidate:
+            break
+        candidate = parent
+    return None
+
+
+def _get_genai_model_dir(model: ONNXModelHandler) -> str:
+    """Get the ORT GenAI model root directory (where genai_config.json lives).
+
+    Falls back to the ONNX file's parent directory if genai_config.json is not found.
+    """
+    genai_config_path = _find_genai_config(model)
+    if genai_config_path is not None:
+        return str(genai_config_path.parent)
+    return str(Path(model.model_path).parent)
+
+
 @Registry.register(str(Framework.ONNX))
 @Registry.register("OnnxEvaluator")
 class OnnxEvaluator(_OliveEvaluator, OnnxEvaluatorMixin):
@@ -584,9 +613,14 @@ class OnnxEvaluator(_OliveEvaluator, OnnxEvaluatorMixin):
 
     @staticmethod
     def _load_genai_config(model: ONNXModelHandler) -> Optional[dict]:
-        """Load genai_config.json from the model directory, or return None if not found."""
-        genai_config_path = Path(model.model_path).parent / "genai_config.json"
-        if not genai_config_path.exists():
+        """Load genai_config.json from the model directory, or return None if not found.
+
+        Searches upward from the ONNX file's parent directory to support nested
+        multi-component model layouts (e.g. ``models/decoder/model.onnx`` where
+        ``genai_config.json`` lives at ``models/``).
+        """
+        genai_config_path = _find_genai_config(model)
+        if genai_config_path is None:
             return None
         import json
 
@@ -845,7 +879,7 @@ class OnnxEvaluator(_OliveEvaluator, OnnxEvaluatorMixin):
         except ImportError as e:
             raise ImportError("Pillow is required for vision evaluation. Install it with: pip install Pillow") from e
 
-        model_dir = str(Path(model.model_path).parent)
+        model_dir = _get_genai_model_dir(model)
 
         # Default max_length; can be overridden per-sample from the data config.
         default_max_length = 4096
@@ -881,7 +915,6 @@ class OnnxEvaluator(_OliveEvaluator, OnnxEvaluatorMixin):
                     pil_image = item.get("image")
                     question = item.get("question", "")
                     sys_prompt = item.get("system_prompt", "")
-                    extract_option_letter = item.get("extract_option_letter", False)
                     num_choices = item.get("num_choices", 0)
                     max_length = item.get("max_length", default_max_length)
 
@@ -919,6 +952,11 @@ class OnnxEvaluator(_OliveEvaluator, OnnxEvaluatorMixin):
                         prompt = tokenizer.apply_chat_template(messages_json, add_generation_prompt=True)
                         inputs = processor(prompt, images=images)
 
+                        # Remove audio_features if present but not needed (vision-only inference)
+                        # to avoid "Model output was not found: audio_features" errors
+                        if "audio_features" in inputs:
+                            del inputs["audio_features"]
+
                         params = og.GeneratorParams(og_model)
                         params.set_search_options(max_length=max_length, do_sample=False)
 
@@ -938,9 +976,9 @@ class OnnxEvaluator(_OliveEvaluator, OnnxEvaluatorMixin):
 
                     sample_idx += 1
 
-                    # For multiple-choice tasks, extract the answer from responses.
-                    # First try digit extraction (for 1-based numbered options),
-                    # then fall back to letter extraction (for A/B/C/D options).
+                    # For multiple-choice tasks, extract the answer digit from responses
+                    # like "2", "The answer is 3", or "1. D" to match the expected answer format.
+                    # Only enabled when num_choices is between 1 and 9 (single-digit options).
                     if 1 <= num_choices <= 9 and pred:
                         pattern = rf"\b([1-{num_choices}])\b"
                         num_match = re.search(pattern, pred)
@@ -953,10 +991,6 @@ class OnnxEvaluator(_OliveEvaluator, OnnxEvaluatorMixin):
                                 if ch in valid_digits:
                                     pred = ch
                                     break
-                    elif extract_option_letter and pred:
-                        letter_match = re.search(r"\b([A-Z])\b", pred)
-                        if letter_match:
-                            pred = letter_match.group(1)
                     all_preds.append(pred)
 
                 # Collect reference texts (aligned with preds including empty ones for None images)
@@ -996,7 +1030,7 @@ class OnnxEvaluator(_OliveEvaluator, OnnxEvaluatorMixin):
 
         import soundfile as sf
 
-        model_dir = str(Path(model.model_path).parent)
+        model_dir = _get_genai_model_dir(model)
 
         # Read genai_config to determine model properties
         with (Path(model_dir) / "genai_config.json").open() as f:
@@ -1130,7 +1164,7 @@ class OnnxEvaluator(_OliveEvaluator, OnnxEvaluatorMixin):
 
         import json
 
-        model_dir = str(Path(model.model_path).parent)
+        model_dir = _get_genai_model_dir(model)
 
         with (Path(model_dir) / "genai_config.json").open() as f:
             genai_config = json.load(f)
@@ -1952,7 +1986,7 @@ class LMEvaluator(OliveEvaluator):
             }
         elif self.model_class == "ortgenai":
             init_args = {
-                "pretrained": str(Path(model.model_path).parent),
+                "pretrained": _get_genai_model_dir(model),
                 "ep": self.ep or execution_providers,
                 "ep_options": self.ep_options,
                 "device": device,
@@ -2067,8 +2101,8 @@ class MTEBEvaluator(OliveEvaluator):
                 model_class = "hf"
             elif isinstance(model, ONNXModelHandler):
                 # ModelBuilder outputs ONNXModelHandler but with genai_config.json
-                genai_config = Path(model.model_path).parent / "genai_config.json"
-                model_class = "ortgenai" if genai_config.exists() else "ort"
+                genai_config_path = _find_genai_config(model)
+                model_class = "ortgenai" if genai_config_path is not None else "ort"
             else:
                 raise ValueError(
                     "Unable to auto-detect model_class for MTEBEvaluator from model handler "
@@ -2103,7 +2137,7 @@ class MTEBEvaluator(OliveEvaluator):
             )
         elif model_class == "ortgenai":
             mteb_model = MTEBORTGenAIEvaluator(
-                pretrained=str(Path(model.model_path).parent),
+                pretrained=_get_genai_model_dir(model),
                 batch_size=self.batch_size,
                 max_length=self.max_length,
                 ep=self.ep
